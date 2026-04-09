@@ -44,7 +44,6 @@ import asyncio
 import json
 import logging
 import os
-import sqlite3
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -62,21 +61,20 @@ from mcp.server.fastmcp import FastMCP
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 FACEIT_API_KEY: str = (os.getenv("FACEIT_API_KEY") or "").strip()
-
-_default_db = Path.home() / ".faceit-mcp" / "data.db"
-DB_PATH: str = (os.getenv("DB_PATH") or "").strip() or str(_default_db)
+DB_PATH: str = (os.getenv("DB_PATH") or "").strip() or str(Path.home() / ".faceit-mcp" / "data.db")
 
 FACEIT_BASE_URL = "https://open.faceit.com/data/v4"
 GAME_ID = "cs2"
 
 HTTP_TIMEOUT_SEC = 15
-FACEIT_RETRY_EXTRA_ATTEMPTS = 1
-FACEIT_RETRY_BASE_DELAY_SEC = 1.5
-FACEIT_RETRY_MAX_DELAY_SEC = 10.0
-FACEIT_CIRCUIT_FAILURE_THRESHOLD = max(
-    0, int(os.getenv("FACEIT_CIRCUIT_FAILURE_THRESHOLD", "4"))
-)
+FACEIT_RETRY_ATTEMPTS = 2
+FACEIT_RETRY_BASE_DELAY = 1.5
+FACEIT_RETRY_MAX_DELAY = 10.0
+FACEIT_CIRCUIT_THRESHOLD = max(0, int(os.getenv("FACEIT_CIRCUIT_FAILURE_THRESHOLD", "4")))
 FACEIT_CIRCUIT_OPEN_SEC = float(os.getenv("FACEIT_CIRCUIT_OPEN_SEC", "60"))
+
+_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SEC)
+_LEADERBOARD_SEM = asyncio.Semaphore(8)
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +83,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class TTLCache:
-    """Key-value store with per-entry TTL expiry and LRU eviction."""
+    """LRU cache with per-entry TTL expiry."""
 
     def __init__(self, maxsize: int = 1000) -> None:
         if maxsize < 1:
@@ -111,6 +109,7 @@ class TTLCache:
         while len(self._store) > self._maxsize:
             self._store.popitem(last=False)
 
+
 # ---------------------------------------------------------------------------
 # FACEIT API client
 # ---------------------------------------------------------------------------
@@ -120,28 +119,25 @@ _TTL_NICKNAME = 120.0
 _TTL_LIFETIME = 120.0
 _TTL_MATCH_STATS = 60.0
 
-_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SEC)
-
 
 class FaceitAPIError(Exception):
     pass
 
+
 class FaceitNotFoundError(FaceitAPIError):
     pass
+
 
 class FaceitUnavailableError(FaceitAPIError):
     pass
 
+
 class FaceitCircuitOpenError(FaceitUnavailableError):
     pass
 
+
 class FaceitRateLimitError(FaceitAPIError):
     pass
-
-
-def _backoff_seconds(attempt_index: int) -> float:
-    raw = FACEIT_RETRY_BASE_DELAY_SEC * (2 ** attempt_index)
-    return min(FACEIT_RETRY_MAX_DELAY_SEC, raw)
 
 
 class FaceitAPI:
@@ -165,11 +161,11 @@ class FaceitAPI:
                 raise FaceitNotFoundError("Not found")
             if resp.status == 429:
                 raise FaceitRateLimitError("Rate limited")
-            if resp.status >= 500 or resp.status == 503:
+            if resp.status >= 500:
                 raise FaceitUnavailableError(f"Server error {resp.status}")
             if resp.status >= 400:
                 text = await resp.text()
-                logger.warning("FACEIT error %s: %s", resp.status, text[:200])
+                logger.warning("FACEIT %s %s", resp.status, text[:200])
                 raise FaceitAPIError(f"API error {resp.status}")
             return await resp.json()
 
@@ -177,45 +173,38 @@ class FaceitAPI:
         url = f"{FACEIT_BASE_URL}{path}"
         last_exc: Exception = FaceitAPIError("unknown")
 
-        if FACEIT_CIRCUIT_FAILURE_THRESHOLD > 0:
-            now = time.monotonic()
-            if now < self._circuit_open_until:
-                raise FaceitCircuitOpenError(
-                    "FACEIT circuit open — cooling down after repeated failures."
-                )
+        if FACEIT_CIRCUIT_THRESHOLD > 0 and time.monotonic() < self._circuit_open_until:
+            raise FaceitCircuitOpenError("FACEIT circuit open — cooling down.")
 
-        for attempt in range(FACEIT_RETRY_EXTRA_ATTEMPTS + 1):
+        for attempt in range(FACEIT_RETRY_ATTEMPTS):
             try:
                 result = await self._do_request(method, url, **kwargs)
                 self._circuit_fail_streak = 0
                 return result
-            except FaceitRateLimitError as exc:
+            except (FaceitRateLimitError, FaceitUnavailableError) as exc:
                 last_exc = exc
-                if attempt < FACEIT_RETRY_EXTRA_ATTEMPTS:
-                    await asyncio.sleep(_backoff_seconds(attempt))
-            except FaceitUnavailableError as exc:
-                last_exc = exc
-                if attempt < FACEIT_RETRY_EXTRA_ATTEMPTS:
-                    await asyncio.sleep(_backoff_seconds(attempt))
+                if attempt < FACEIT_RETRY_ATTEMPTS - 1:
+                    delay = min(FACEIT_RETRY_MAX_DELAY, FACEIT_RETRY_BASE_DELAY * (2 ** attempt))
+                    await asyncio.sleep(delay)
             except aiohttp.ServerTimeoutError:
-                last_exc = FaceitUnavailableError(f"Request timed out after {HTTP_TIMEOUT_SEC}s")
-                if attempt < FACEIT_RETRY_EXTRA_ATTEMPTS:
-                    await asyncio.sleep(_backoff_seconds(attempt))
+                last_exc = FaceitUnavailableError(f"Timed out after {HTTP_TIMEOUT_SEC}s")
+                if attempt < FACEIT_RETRY_ATTEMPTS - 1:
+                    delay = min(FACEIT_RETRY_MAX_DELAY, FACEIT_RETRY_BASE_DELAY * (2 ** attempt))
+                    await asyncio.sleep(delay)
             except aiohttp.ClientError as exc:
                 raise FaceitUnavailableError(str(exc)) from exc
             except (FaceitNotFoundError, FaceitAPIError):
                 raise
 
-        if FACEIT_CIRCUIT_FAILURE_THRESHOLD > 0 and isinstance(
+        if FACEIT_CIRCUIT_THRESHOLD > 0 and isinstance(
             last_exc, (FaceitRateLimitError, FaceitUnavailableError)
         ):
             self._circuit_fail_streak += 1
-            if self._circuit_fail_streak >= FACEIT_CIRCUIT_FAILURE_THRESHOLD:
+            if self._circuit_fail_streak >= FACEIT_CIRCUIT_THRESHOLD:
                 self._circuit_open_until = time.monotonic() + FACEIT_CIRCUIT_OPEN_SEC
                 self._circuit_fail_streak = 0
-                logger.warning(
-                    "FACEIT circuit breaker open for %.0fs", FACEIT_CIRCUIT_OPEN_SEC
-                )
+                logger.warning("FACEIT circuit open for %.0fs", FACEIT_CIRCUIT_OPEN_SEC)
+
         raise last_exc
 
     async def _cached_get(self, key: str, ttl: float, path: str, **kwargs: Any) -> Any:
@@ -229,31 +218,31 @@ class FaceitAPI:
         return result
 
     async def get_player_by_nickname(self, nickname: str) -> dict[str, Any]:
-        key = f"nick:{nickname.lower()}"
-        params = {"nickname": nickname, "game": GAME_ID}
-        return await self._cached_get(key, _TTL_NICKNAME, "/players", params=params)
+        return await self._cached_get(
+            f"nick:{nickname.lower()}", _TTL_NICKNAME,
+            "/players", params={"nickname": nickname, "game": GAME_ID},
+        )
 
     async def get_player_by_id(self, player_id: str) -> dict[str, Any]:
-        key = f"player:{player_id}"
-        return await self._cached_get(key, _TTL_PLAYER, f"/players/{player_id}")
+        return await self._cached_get(f"player:{player_id}", _TTL_PLAYER, f"/players/{player_id}")
 
     async def get_player_stats_lifetime(self, player_id: str) -> dict[str, Any]:
-        key = f"lifetime:{player_id}"
         return await self._cached_get(
-            key, _TTL_LIFETIME, f"/players/{player_id}/stats/{GAME_ID}"
+            f"lifetime:{player_id}", _TTL_LIFETIME, f"/players/{player_id}/stats/{GAME_ID}"
         )
 
     async def get_player_match_stats(
         self, player_id: str, limit: int = 10, offset: int = 0
     ) -> dict[str, Any]:
-        key = f"match_stats:{player_id}:{limit}:{offset}"
-        path = f"/players/{player_id}/games/{GAME_ID}/stats"
-        params: dict[str, Any] = {"limit": limit, "offset": offset}
-        return await self._cached_get(key, _TTL_MATCH_STATS, path, params=params)
+        return await self._cached_get(
+            f"match_stats:{player_id}:{limit}:{offset}", _TTL_MATCH_STATS,
+            f"/players/{player_id}/games/{GAME_ID}/stats",
+            params={"limit": limit, "offset": offset},
+        )
 
 
 # ---------------------------------------------------------------------------
-# FACEIT stat parsers (ported from faceit_api.py)
+# Stat parsers
 # ---------------------------------------------------------------------------
 
 def _to_float(val: Any) -> float | None:
@@ -265,6 +254,19 @@ def _to_float(val: Any) -> float | None:
         return float(str(val).replace("%", "").strip())
     except (TypeError, ValueError):
         return None
+
+
+def _to_int(val: float | None) -> int | str:
+    return int(val) if val is not None else "N/A"
+
+
+def _fmt(v: float | None, fmt: str, suffix: str = "", fallback: str = "N/A") -> str:
+    if v is None:
+        return fallback
+    try:
+        return format(float(v), fmt) + suffix
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _first_present(d: dict[str, Any], *keys: str) -> Any:
@@ -287,79 +289,43 @@ def _infer_win(result: Any) -> bool | None:
     return None
 
 
-def _pick_lifetime_value(lifetime: dict[str, Any], *keys: str) -> Any:
+def _pick(lifetime: dict[str, Any], *keys: str) -> Any:
+    """Exact key lookup, then case-insensitive fallback."""
     for k in keys:
         if k in lifetime:
             return lifetime[k]
     lower = {str(k).strip().lower(): v for k, v in lifetime.items()}
     for k in keys:
-        kl = k.strip().lower()
-        if kl in lower:
+        if (kl := k.strip().lower()) in lower:
             return lower[kl]
     return None
 
 
-def _pick_first_key_substring(lifetime: dict[str, Any], needle: str) -> Any:
+def _pick_substring(lifetime: dict[str, Any], needle: str) -> Any:
     n = needle.lower()
     for k, v in sorted(lifetime.items(), key=lambda kv: str(kv[0])):
-        if v is None or v == "":
-            continue
-        if n in str(k).lower():
+        if v is not None and v != "" and n in str(k).lower():
             return v
     return None
 
 
-def _pick_mvp_like(lifetime: dict[str, Any]) -> Any:
-    for k, v in sorted(lifetime.items(), key=lambda kv: str(kv[0])):
-        if v is None or v == "":
-            continue
-        if "mvp" in str(k).lower():
-            return v
-    return None
-
-
-def _pick_rounds_like(lifetime: dict[str, Any]) -> Any:
+def _pick_rounds(lifetime: dict[str, Any]) -> Any:
     scored: list[tuple[int, Any, str]] = []
     for k, v in lifetime.items():
         if v is None or v == "":
             continue
         kl = str(k).lower()
-        if "round" not in kl or "win" in kl:
+        if "round" not in kl or "win" in kl or ("per" in kl and "round" in kl):
             continue
-        if "per" in kl and "round" in kl:
-            continue
-        score = 0
-        if "total" in kl:
-            score += 2
-        if "played" in kl or kl.strip() == "rounds":
-            score += 2
-        if "rounds" in kl:
-            score += 1
+        score = (2 if "total" in kl else 0) + (2 if "played" in kl or kl.strip() == "rounds" else 0) + (1 if "rounds" in kl else 0)
         scored.append((score, v, kl))
-    if not scored:
-        return None
-    scored.sort(key=lambda t: (-t[0], t[2]))
-    return scored[0][1]
-
-
-def _pick_kr_like(lifetime: dict[str, Any]) -> Any:
-    for needle in ("kills per round", "average k/r", "average kr", "k/r ratio", "kpr"):
-        v = _pick_first_key_substring(lifetime, needle)
-        if v is not None:
-            return v
-    return None
+    return scored and sorted(scored, key=lambda t: (-t[0], t[2]))[0][1]
 
 
 def _segment_sort_key(segment: Any) -> tuple[str, str]:
     if not isinstance(segment, dict):
         return ("", "")
-    name = str(
-        segment.get("label")
-        or segment.get("name")
-        or segment.get("mode")
-        or segment.get("type")
-        or ""
-    )
+    name = str(segment.get("label") or segment.get("name") or segment.get("mode") or segment.get("type") or "")
     sid = str(segment.get("segment_id") or segment.get("id") or "")
     return (name, sid)
 
@@ -370,63 +336,57 @@ def extract_cs2_game(player: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def lifetime_map_from_stats_response(st: dict[str, Any] | None) -> dict[str, Any]:
+    """Merge lifetime + segment stats into one flat label→value dict."""
     if not isinstance(st, dict):
         return {}
+
+    merged: dict[str, Any] = {}
 
     def merge_missing(src: dict[str, Any]) -> None:
         for k, v in src.items():
             if v is None or v == "":
                 continue
             ks = str(k).strip()
-            cur = merged.get(ks)
-            if cur is None or cur == "":
+            if merged.get(ks) in (None, ""):
                 merged[ks] = v
 
-    merged: dict[str, Any] = {}
     life = st.get("lifetime")
     if isinstance(life, dict):
         merge_missing(life)
-    segments = st.get("segments")
-    if isinstance(segments, list):
-        for seg in sorted(segments, key=_segment_sort_key):
-            if not isinstance(seg, dict):
-                continue
-            raw = seg.get("stats")
-            if isinstance(raw, dict):
-                merge_missing(raw)
-            elif isinstance(raw, list):
-                for row in raw:
-                    if not isinstance(row, dict):
-                        continue
-                    label = row.get("label") or row.get("name") or row.get("key")
-                    if label is None:
-                        continue
-                    val = row.get("value")
-                    if val is None and "count" in row:
-                        val = row.get("count")
-                    if val is None:
-                        continue
+
+    for seg in sorted(st.get("segments") or [], key=_segment_sort_key):
+        if not isinstance(seg, dict):
+            continue
+        raw = seg.get("stats")
+        if isinstance(raw, dict):
+            merge_missing(raw)
+        elif isinstance(raw, list):
+            for row in raw:
+                if not isinstance(row, dict):
+                    continue
+                label = row.get("label") or row.get("name") or row.get("key")
+                val = row.get("value") if row.get("value") is not None else row.get("count")
+                if label is not None and val is not None:
                     merge_missing({str(label): val})
+
     return merged
 
 
-def _finalize_wl_from_matches_wr(p: dict[str, Any]) -> None:
-    wr = p.get("win_rate_pct")
-    m = p.get("matches")
-    if wr is None or m is None:
-        return
-    try:
-        mf, wrf = float(m), float(wr)
-    except (TypeError, ValueError):
-        return
-    if mf <= 0:
+def _infer_wl(p: dict[str, Any]) -> None:
+    """Fill missing wins/losses from matches + win rate, or from each other."""
+    mf = _to_float(p.get("matches"))
+    if mf is None or mf <= 0:
         return
     wn, ls = p.get("wins"), p.get("losses")
-    if wn is None and ls is None:
-        mi = int(round(mf))
-        w = max(0, min(int(round(mf * wrf / 100.0)), mi))
-        p["wins"] = float(w)
-        p["losses"] = float(mi - w)
+    wr = p.get("win_rate_pct")
+
+    if wn is None and ls is None and wr is not None:
+        try:
+            mi = int(round(mf))
+            w = max(0, min(int(round(mf * float(wr) / 100.0)), mi))
+            p["wins"], p["losses"] = float(w), float(mi - w)
+        except (TypeError, ValueError):
+            pass
     elif ls is None and wn is not None:
         try:
             p["losses"] = max(0.0, mf - float(wn))
@@ -440,95 +400,76 @@ def _finalize_wl_from_matches_wr(p: dict[str, Any]) -> None:
 
 
 def _enrich_lifetime_stats(p: dict[str, Any]) -> None:
-    m = p.get("matches")
-    mf = float(m) if m is not None else None
-    if mf is not None and mf > 0:
-        if p.get("losses") is None and p.get("wins") is not None:
-            p["losses"] = max(0.0, mf - float(p["wins"]))
-        if p.get("wins") is None and p.get("losses") is not None:
-            p["wins"] = max(0.0, mf - float(p["losses"]))
-    wr = p.get("win_rate_pct")
-    if (
-        p.get("wins") is None
-        and p.get("losses") is None
-        and mf is not None
-        and mf > 0
-        and wr is not None
-    ):
-        mi = int(round(mf))
-        w = max(0, min(int(round(mf * float(wr) / 100.0)), mi))
-        p["wins"] = float(w)
-        p["losses"] = float(mi - w)
-    if mf is not None and mf > 0:
+    """Fill derived fields (wins/losses, averages, K/R) where possible."""
+    mf = _to_float(p.get("matches"))
+
+    _infer_wl(p)
+
+    if mf and mf > 0:
         if p.get("kills") is None and p.get("avg_kills") is not None:
             p["kills"] = float(p["avg_kills"]) * mf
         if p.get("deaths") is None and p.get("avg_deaths") is not None:
             p["deaths"] = float(p["avg_deaths"]) * mf
-    if p.get("kills") is None and p.get("kd") is not None and p.get("deaths"):
-        df = float(p["deaths"])
-        if df > 0:
-            p["kills"] = float(p["kd"]) * df
-    if p.get("deaths") is None and p.get("kd") is not None and p.get("kills"):
-        kdf = float(p["kd"])
-        if kdf > 0:
-            p["deaths"] = float(p["kills"]) / kdf
-    if p.get("kr") is None and p.get("kills") is not None and p.get("rounds"):
-        rf = float(p["rounds"])
-        if rf > 0:
-            p["kr"] = float(p["kills"]) / rf
-    if mf is not None and mf > 0:
+
+    if p.get("kills") is None and p.get("kd") and p.get("deaths"):
+        try:
+            if (df := float(p["deaths"])) > 0:
+                p["kills"] = float(p["kd"]) * df
+        except (TypeError, ValueError):
+            pass
+
+    if p.get("deaths") is None and p.get("kd") and p.get("kills"):
+        try:
+            if (kdf := float(p["kd"])) > 0:
+                p["deaths"] = float(p["kills"]) / kdf
+        except (TypeError, ValueError):
+            pass
+
+    if mf and mf > 0:
         if p.get("avg_kills") is None and p.get("kills") is not None:
             p["avg_kills"] = float(p["kills"]) / mf
         if p.get("avg_deaths") is None and p.get("deaths") is not None:
             p["avg_deaths"] = float(p["deaths"]) / mf
-    _finalize_wl_from_matches_wr(p)
+
     if p.get("kr") is None and p.get("kills") is not None and p.get("rounds"):
         try:
-            rf = float(p["rounds"])
-            if rf > 0:
+            if (rf := float(p["rounds"])) > 0:
                 p["kr"] = float(p["kills"]) / rf
         except (TypeError, ValueError, ZeroDivisionError):
             pass
 
 
 def parse_lifetime_stats(lifetime: dict[str, Any]) -> dict[str, Any]:
-    matches = _pick_lifetime_value(lifetime, "Matches", "Total Matches", "Number of Matches", "Games")
-    win_rate = _pick_lifetime_value(lifetime, "Win Rate %", "Win Rate", "Win Rate % ")
-    kd = _pick_lifetime_value(lifetime, "Average K/D Ratio", "Average K/D", "K/D Ratio", "Average KDR", "KDR")
-    hs = _pick_lifetime_value(lifetime, "Average Headshots %", "Headshots %", "Average Headshots")
-    streak = _pick_lifetime_value(lifetime, "Longest Win Streak", "Longest Win Streak ", "Best Win Streak")
-    wins = _pick_lifetime_value(lifetime, "Wins", "Total Wins", "Games Won", "Match Wins", "Game Wins", "Games Win")
-    losses = _pick_lifetime_value(lifetime, "Losses", "Total Losses", "Games Lost", "Match Losses", "Game Losses", "Games Loss")
-    kills = _pick_lifetime_value(lifetime, "Kills", "Total Kills", "Total kills", "Kill Count")
-    deaths = _pick_lifetime_value(lifetime, "Deaths", "Total Deaths", "Total deaths")
-    assists = _pick_lifetime_value(lifetime, "Assists", "Total Assists", "Total assists")
-    rounds = _pick_lifetime_value(lifetime, "Rounds", "Total Rounds", "Rounds Played", "Total Rounds Played", "Rounds played")
-    if rounds is None:
-        rounds = _pick_rounds_like(lifetime)
-    mvps = _pick_lifetime_value(lifetime, "MVPs", "MVP", "Total MVPs", "Total MVP", "MVP Stars", "Most Valuable Player")
+    mvps = _pick(lifetime, "MVPs", "MVP", "Total MVPs", "Total MVP", "MVP Stars", "Most Valuable Player")
     if mvps is None:
-        mvps = _pick_mvp_like(lifetime)
-    avg_kills = _pick_lifetime_value(lifetime, "Average Kills", "Avg Kills", "Kills / Match", "Kills per Match", "Average Kills per Match")
-    avg_deaths = _pick_lifetime_value(lifetime, "Average Deaths", "Avg Deaths", "Deaths / Match", "Deaths per Match", "Average Deaths per Match")
-    kr = _pick_lifetime_value(lifetime, "Average K/R Ratio", "K/R Ratio", "Average KR", "Average K/R", "KPR", "K/R", "Average Kills per Round", "Kills per Round", "Kills Per Round")
+        mvps = _pick_substring(lifetime, "mvp")
+
+    kr = _pick(lifetime, "Average K/R Ratio", "K/R Ratio", "Average KR", "Average K/R", "KPR", "K/R", "Average Kills per Round", "Kills per Round", "Kills Per Round")
     if kr is None:
-        kr = _pick_kr_like(lifetime)
+        for needle in ("kills per round", "average k/r", "average kr", "k/r ratio", "kpr"):
+            if (kr := _pick_substring(lifetime, needle)) is not None:
+                break
+
+    rounds = _pick(lifetime, "Rounds", "Total Rounds", "Rounds Played", "Total Rounds Played", "Rounds played")
+    if rounds is None:
+        rounds = _pick_rounds(lifetime)
+
     result = {
-        "matches": _to_float(matches),
-        "win_rate_pct": _to_float(win_rate),
-        "kd": _to_float(kd),
-        "hs_pct": _to_float(hs),
-        "longest_win_streak": _to_float(streak),
-        "wins": _to_float(wins),
-        "losses": _to_float(losses),
-        "kills": _to_float(kills),
-        "deaths": _to_float(deaths),
-        "assists": _to_float(assists),
-        "rounds": _to_float(rounds),
-        "mvps": _to_float(mvps),
-        "avg_kills": _to_float(avg_kills),
-        "avg_deaths": _to_float(avg_deaths),
-        "kr": _to_float(kr),
+        "matches":            _to_float(_pick(lifetime, "Matches", "Total Matches", "Number of Matches", "Games")),
+        "win_rate_pct":       _to_float(_pick(lifetime, "Win Rate %", "Win Rate", "Win Rate % ")),
+        "kd":                 _to_float(_pick(lifetime, "Average K/D Ratio", "Average K/D", "K/D Ratio", "Average KDR", "KDR")),
+        "hs_pct":             _to_float(_pick(lifetime, "Average Headshots %", "Headshots %", "Average Headshots")),
+        "longest_win_streak": _to_float(_pick(lifetime, "Longest Win Streak", "Longest Win Streak ", "Best Win Streak")),
+        "wins":               _to_float(_pick(lifetime, "Wins", "Total Wins", "Games Won", "Match Wins", "Game Wins", "Games Win")),
+        "losses":             _to_float(_pick(lifetime, "Losses", "Total Losses", "Games Lost", "Match Losses", "Game Losses", "Games Loss")),
+        "kills":              _to_float(_pick(lifetime, "Kills", "Total Kills", "Total kills", "Kill Count")),
+        "deaths":             _to_float(_pick(lifetime, "Deaths", "Total Deaths", "Total deaths")),
+        "assists":            _to_float(_pick(lifetime, "Assists", "Total Assists", "Total assists")),
+        "rounds":             _to_float(rounds),
+        "mvps":               _to_float(mvps),
+        "avg_kills":          _to_float(_pick(lifetime, "Average Kills", "Avg Kills", "Kills / Match", "Kills per Match", "Average Kills per Match")),
+        "avg_deaths":         _to_float(_pick(lifetime, "Average Deaths", "Avg Deaths", "Deaths / Match", "Deaths per Match", "Average Deaths per Match")),
+        "kr":                 _to_float(kr),
     }
     _enrich_lifetime_stats(result)
     return result
@@ -542,45 +483,35 @@ def parse_match_stats_row(stats: dict[str, Any]) -> dict[str, Any]:
         try:
             kd = float(kills) / float(deaths) if float(deaths) else None
         except (TypeError, ValueError, ZeroDivisionError):
-            kd = None
-    result = _first_present(stats, "Result", "Game Result")
-    won = _infer_win(result)
+            pass
     map_name = _first_present(stats, "Map", "Map Name")
-    finished = _first_present(stats, "Match Finished At", "Finished At")
-    match_id = _first_present(stats, "Match Id", "Match ID", "MatchId", "match_id")
-    hs = _first_present(stats, "Average Headshots %", "Headshots %", "Average Headshots")
-    mvps = _first_present(stats, "MVPs", "MVP", "Total MVPs", "Total MVP", "MVP Stars")
-    kr = _first_present(stats, "Average K/R Ratio", "K/R Ratio", "Average K/R", "K/R", "Average Kills per Round", "Kills per Round", "Kills Per Round")
-    rounds = _first_present(stats, "Rounds", "Rounds Played", "Total Rounds", "Total Rounds Played")
     return {
-        "match_id": str(match_id) if match_id else None,
-        "won": won,
-        "kills": _to_float(kills),
-        "deaths": _to_float(deaths),
-        "kd": _to_float(kd),
-        "map": str(map_name) if map_name else "—",
-        "finished_at": finished,
-        "hs_pct": _to_float(hs),
-        "mvps": _to_float(mvps),
-        "kr": _to_float(kr),
-        "rounds": _to_float(rounds),
+        "match_id": str(v) if (v := _first_present(stats, "Match Id", "Match ID", "MatchId", "match_id")) else None,
+        "won":        _infer_win(_first_present(stats, "Result", "Game Result")),
+        "map":        str(map_name) if map_name else "—",
+        "kills":      _to_float(kills),
+        "deaths":     _to_float(deaths),
+        "kd":         _to_float(kd),
+        "hs_pct":     _to_float(_first_present(stats, "Average Headshots %", "Headshots %", "Average Headshots")),
+        "mvps":       _to_float(_first_present(stats, "MVPs", "MVP", "Total MVPs", "Total MVP", "MVP Stars")),
+        "kr":         _to_float(_first_present(stats, "Average K/R Ratio", "K/R Ratio", "Average K/R", "K/R", "Average Kills per Round", "Kills per Round", "Kills Per Round")),
+        "rounds":     _to_float(_first_present(stats, "Rounds", "Rounds Played", "Total Rounds", "Total Rounds Played")),
+        "finished_at": _first_present(stats, "Match Finished At", "Finished At"),
     }
 
 
 # ---------------------------------------------------------------------------
-# Database (SQLite — stores registered users and ELO history)
+# Database
 # ---------------------------------------------------------------------------
 
-_SCHEMA_USERS = """
+_SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     telegram_id      INTEGER PRIMARY KEY,
     faceit_nickname  TEXT    NOT NULL,
     faceit_player_id TEXT    NOT NULL,
     registered_at    TEXT    DEFAULT CURRENT_TIMESTAMP
 );
-"""
 
-_SCHEMA_ELO_SNAPSHOTS = """
 CREATE TABLE IF NOT EXISTS elo_snapshots (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     telegram_id  INTEGER NOT NULL,
@@ -589,12 +520,10 @@ CREATE TABLE IF NOT EXISTS elo_snapshots (
     recorded_at  TEXT    DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (telegram_id) REFERENCES users(telegram_id) ON DELETE CASCADE
 );
-"""
 
-_INDEXES = [
-    "CREATE INDEX IF NOT EXISTS idx_elo_snapshots_tid ON elo_snapshots(telegram_id, recorded_at);",
-    "CREATE INDEX IF NOT EXISTS idx_users_player_id ON users(faceit_player_id);",
-]
+CREATE INDEX IF NOT EXISTS idx_elo_snapshots_tid ON elo_snapshots(telegram_id, recorded_at);
+CREATE INDEX IF NOT EXISTS idx_users_player_id   ON users(faceit_player_id);
+"""
 
 
 async def init_db(db_path: str = DB_PATH) -> None:
@@ -602,15 +531,14 @@ async def init_db(db_path: str = DB_PATH) -> None:
     async with aiosqlite.connect(db_path) as db:
         await db.execute("PRAGMA journal_mode = WAL")
         await db.execute("PRAGMA synchronous = NORMAL")
-        await db.execute(_SCHEMA_USERS)
-        await db.execute(_SCHEMA_ELO_SNAPSHOTS)
-        for idx_sql in _INDEXES:
-            await db.execute(idx_sql)
+        for stmt in _SCHEMA.split(";"):
+            if stmt.strip():
+                await db.execute(stmt)
         await db.commit()
 
 
 # ---------------------------------------------------------------------------
-# Server + shared FACEIT client
+# MCP server
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP(
@@ -622,7 +550,6 @@ mcp = FastMCP(
     ),
 )
 
-_http: aiohttp.ClientSession | None = None
 _faceit: FaceitAPI | None = None
 
 
@@ -631,20 +558,7 @@ def _api() -> FaceitAPI:
     return _faceit
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _fmt_opt(v: float | None, fmt: str, fallback: str = "N/A") -> str:
-    if v is None:
-        return fallback
-    try:
-        return format(float(v), fmt)
-    except (TypeError, ValueError):
-        return fallback
-
-
-async def _bundle_for_nickname(nickname: str) -> dict[str, Any]:
+async def _load_player(nickname: str) -> dict[str, Any]:
     pl = await _api().get_player_by_nickname(nickname.strip())
     pid = pl.get("player_id")
     if not pid:
@@ -654,26 +568,16 @@ async def _bundle_for_nickname(nickname: str) -> dict[str, Any]:
         _api().get_player_stats_lifetime(pid),
     )
     g = extract_cs2_game(p) or {}
-    life = lifetime_map_from_stats_response(st if isinstance(st, dict) else None)
-    parsed = parse_lifetime_stats(life)
+    parsed = parse_lifetime_stats(lifetime_map_from_stats_response(st if isinstance(st, dict) else None))
     return {
         "player_id": pid,
-        "nickname": p.get("nickname") or nickname,
-        "elo": int(g.get("faceit_elo") or 0),
-        "level": int(g.get("skill_level") or 0),
-        "region": str(g.get("region") or "—"),
-        "country": (p.get("country") or "").upper() or "—",
-        "kd": parsed["kd"],
-        "hs_pct": parsed["hs_pct"],
-        "win_rate_pct": parsed["win_rate_pct"],
-        "matches": parsed["matches"],
-        "wins": parsed["wins"],
-        "losses": parsed["losses"],
-        "longest_win_streak": parsed["longest_win_streak"],
-        "avg_kills": parsed["avg_kills"],
-        "kr": parsed["kr"],
-        "mvps": parsed["mvps"],
+        "nickname":  p.get("nickname") or nickname,
+        "elo":       int(g.get("faceit_elo") or 0),
+        "level":     int(g.get("skill_level") or 0),
+        "region":    str(g.get("region") or "—"),
+        "country":   (p.get("country") or "").upper() or "—",
         "faceit_url": str(p.get("faceit_url") or ""),
+        **{k: parsed[k] for k in ("kd", "hs_pct", "win_rate_pct", "matches", "wins", "losses", "longest_win_streak", "avg_kills", "kr", "mvps")},
     }
 
 
@@ -689,35 +593,32 @@ async def get_player_stats(nickname: str) -> str:
         nickname: FACEIT nickname (case-insensitive).
     """
     try:
-        b = await _bundle_for_nickname(nickname)
+        b = await _load_player(nickname)
     except FaceitNotFoundError:
         return json.dumps({"error": f"Player '{nickname}' not found on FACEIT."})
     except FaceitAPIError as exc:
         return json.dumps({"error": str(exc)})
 
-    return json.dumps(
-        {
-            "nickname": b["nickname"],
-            "elo": b["elo"],
-            "level": b["level"],
-            "region": b["region"],
-            "country": b["country"],
-            "faceit_url": b["faceit_url"],
-            "stats": {
-                "kd": _fmt_opt(b["kd"], ".2f"),
-                "hs_pct": _fmt_opt(b["hs_pct"], ".1f") + "%" if b["hs_pct"] is not None else "N/A",
-                "win_rate_pct": _fmt_opt(b["win_rate_pct"], ".1f") + "%" if b["win_rate_pct"] is not None else "N/A",
-                "matches": int(b["matches"]) if b["matches"] is not None else "N/A",
-                "wins": int(b["wins"]) if b["wins"] is not None else "N/A",
-                "losses": int(b["losses"]) if b["losses"] is not None else "N/A",
-                "longest_win_streak": int(b["longest_win_streak"]) if b["longest_win_streak"] is not None else "N/A",
-                "avg_kills_per_match": _fmt_opt(b["avg_kills"], ".2f"),
-                "kr": _fmt_opt(b["kr"], ".2f"),
-                "mvps": int(b["mvps"]) if b["mvps"] is not None else "N/A",
-            },
+    return json.dumps({
+        "nickname":   b["nickname"],
+        "elo":        b["elo"],
+        "level":      b["level"],
+        "region":     b["region"],
+        "country":    b["country"],
+        "faceit_url": b["faceit_url"],
+        "stats": {
+            "kd":               _fmt(b["kd"], ".2f"),
+            "hs_pct":           _fmt(b["hs_pct"], ".1f", "%"),
+            "win_rate_pct":     _fmt(b["win_rate_pct"], ".1f", "%"),
+            "matches":          _to_int(b["matches"]),
+            "wins":             _to_int(b["wins"]),
+            "losses":           _to_int(b["losses"]),
+            "longest_win_streak": _to_int(b["longest_win_streak"]),
+            "avg_kills_per_match": _fmt(b["avg_kills"], ".2f"),
+            "kr":               _fmt(b["kr"], ".2f"),
+            "mvps":             _to_int(b["mvps"]),
         },
-        indent=2,
-    )
+    }, indent=2)
 
 
 @mcp.tool()
@@ -734,40 +635,31 @@ async def get_match_history(nickname: str, limit: int = 10) -> str:
         pid = pl.get("player_id")
         if not pid:
             raise FaceitAPIError("No player_id in response")
-        raw = await _api().get_player_match_stats(pid, limit=limit, offset=0)
+        raw = await _api().get_player_match_stats(pid, limit=limit)
     except FaceitNotFoundError:
         return json.dumps({"error": f"Player '{nickname}' not found on FACEIT."})
     except FaceitAPIError as exc:
         return json.dumps({"error": str(exc)})
 
-    items = (raw or {}).get("items") or []
-    matches: list[dict[str, Any]] = []
-    for it in items:
-        if not isinstance(it, dict):
+    matches = []
+    for it in (raw or {}).get("items") or []:
+        if not isinstance(it, dict) or not isinstance(it.get("stats"), dict):
             continue
-        stats = it.get("stats")
-        if not isinstance(stats, dict):
-            continue
-        row = parse_match_stats_row(stats)
-        matches.append(
-            {
-                "match_id": row.get("match_id"),
-                "map": row.get("map") or "—",
-                "result": "Win" if row["won"] is True else ("Loss" if row["won"] is False else "Unknown"),
-                "kd": _fmt_opt(row.get("kd"), ".2f"),
-                "kills": int(row["kills"]) if row.get("kills") is not None else "N/A",
-                "deaths": int(row["deaths"]) if row.get("deaths") is not None else "N/A",
-                "hs_pct": _fmt_opt(row.get("hs_pct"), ".0f") + "%" if row.get("hs_pct") is not None else "N/A",
-                "mvps": int(row["mvps"]) if row.get("mvps") is not None else "N/A",
-                "kr": _fmt_opt(row.get("kr"), ".2f"),
-                "finished_at": row.get("finished_at"),
-            }
-        )
+        row = parse_match_stats_row(it["stats"])
+        matches.append({
+            "match_id":   row["match_id"],
+            "map":        row["map"],
+            "result":     "Win" if row["won"] is True else ("Loss" if row["won"] is False else "Unknown"),
+            "kd":         _fmt(row["kd"], ".2f"),
+            "kills":      _to_int(row["kills"]),
+            "deaths":     _to_int(row["deaths"]),
+            "hs_pct":     _fmt(row["hs_pct"], ".0f", "%"),
+            "mvps":       _to_int(row["mvps"]),
+            "kr":         _fmt(row["kr"], ".2f"),
+            "finished_at": row["finished_at"],
+        })
 
-    return json.dumps(
-        {"nickname": nickname, "matches_returned": len(matches), "matches": matches},
-        indent=2,
-    )
+    return json.dumps({"nickname": nickname, "matches_returned": len(matches), "matches": matches}, indent=2)
 
 
 @mcp.tool()
@@ -777,18 +669,12 @@ async def compare_players(nicknames: list[str]) -> str:
     Args:
         nicknames: List of 2–6 FACEIT nicknames.
     """
-    if len(nicknames) < 2:
-        return json.dumps({"error": "Provide at least 2 nicknames."})
-    if len(nicknames) > 6:
-        return json.dumps({"error": "Maximum 6 nicknames supported."})
+    if not 2 <= len(nicknames) <= 6:
+        return json.dumps({"error": "Provide 2–6 nicknames."})
 
-    results = await asyncio.gather(
-        *[_bundle_for_nickname(n) for n in nicknames],
-        return_exceptions=True,
-    )
+    results = await asyncio.gather(*[_load_player(n) for n in nicknames], return_exceptions=True)
 
-    players: list[dict[str, Any]] = []
-    errors: list[str] = []
+    players, errors = [], []
     for nick, res in zip(nicknames, results):
         if isinstance(res, FaceitNotFoundError):
             errors.append(f"{nick}: not found")
@@ -800,33 +686,30 @@ async def compare_players(nicknames: list[str]) -> str:
     if len(players) < 2:
         return json.dumps({"error": "Could not load enough players.", "details": errors})
 
-    output: list[dict[str, Any]] = []
-    for b in players:
-        output.append(
+    return json.dumps({
+        "players": [
             {
-                "nickname": b["nickname"],
-                "elo": b["elo"],
-                "level": b["level"],
-                "kd": _fmt_opt(b["kd"], ".2f"),
-                "hs_pct": _fmt_opt(b["hs_pct"], ".1f") + "%" if b["hs_pct"] is not None else "N/A",
-                "win_rate_pct": _fmt_opt(b["win_rate_pct"], ".1f") + "%" if b["win_rate_pct"] is not None else "N/A",
-                "matches": int(b["matches"]) if b["matches"] is not None else "N/A",
-                "avg_kills": _fmt_opt(b["avg_kills"], ".2f"),
-                "kr": _fmt_opt(b["kr"], ".2f"),
+                "nickname":     b["nickname"],
+                "elo":          b["elo"],
+                "level":        b["level"],
+                "kd":           _fmt(b["kd"], ".2f"),
+                "hs_pct":       _fmt(b["hs_pct"], ".1f", "%"),
+                "win_rate_pct": _fmt(b["win_rate_pct"], ".1f", "%"),
+                "matches":      _to_int(b["matches"]),
+                "avg_kills":    _fmt(b["avg_kills"], ".2f"),
+                "kr":           _fmt(b["kr"], ".2f"),
             }
-        )
-
-    return json.dumps(
-        {"players": output, "skipped": errors if errors else None},
-        indent=2,
-    )
+            for b in players
+        ],
+        "skipped": errors or None,
+    }, indent=2)
 
 
 @mcp.tool()
 async def get_leaderboard() -> str:
     """Return all registered users ranked by their current live FACEIT CS2 ELO.
 
-    Note: requires users to be registered via a compatible bot or direct DB entry.
+    Note: requires users registered in the DB (via DB_PATH).
     """
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -841,10 +724,8 @@ async def get_leaderboard() -> str:
     if not users:
         return json.dumps({"leaderboard": [], "note": "No registered users."})
 
-    _SEM = asyncio.Semaphore(8)
-
     async def _fetch(u: dict) -> dict[str, Any]:
-        async with _SEM:
+        async with _LEADERBOARD_SEM:
             try:
                 p = await _api().get_player_by_id(u["faceit_player_id"])
             except FaceitAPIError:
@@ -852,18 +733,14 @@ async def get_leaderboard() -> str:
         g = extract_cs2_game(p) or {}
         return {
             "nickname": str(p.get("nickname") or u["faceit_nickname"]),
-            "elo": int(g.get("faceit_elo") or 0),
-            "level": int(g.get("skill_level") or 0),
+            "elo":      int(g.get("faceit_elo") or 0),
+            "level":    int(g.get("skill_level") or 0),
         }
 
     rows = await asyncio.gather(*[_fetch(u) for u in users], return_exceptions=True)
-    valid = [r for r in rows if isinstance(r, dict)]
-    valid.sort(key=lambda r: -r["elo"])
+    valid = sorted([r for r in rows if isinstance(r, dict)], key=lambda r: -r["elo"])
 
-    return json.dumps(
-        {"registered_users": len(users), "leaderboard": valid},
-        indent=2,
-    )
+    return json.dumps({"registered_users": len(users), "leaderboard": valid}, indent=2)
 
 
 @mcp.tool()
@@ -885,45 +762,33 @@ async def get_elo_trend(nickname: str) -> str:
                 row = await cur.fetchone()
 
             if not row:
-                return json.dumps(
-                    {
-                        "error": f"'{nickname}' is not registered. "
-                        "Only users who linked their FACEIT account have stored ELO history."
-                    }
-                )
+                return json.dumps({
+                    "error": f"'{nickname}' is not registered. "
+                             "Only users who linked their FACEIT account have stored ELO history."
+                })
 
-            tid = row["telegram_id"]
             async with db.execute(
                 "SELECT elo, level, recorded_at FROM elo_snapshots "
                 "WHERE telegram_id = ? ORDER BY recorded_at ASC",
-                (tid,),
+                (row["telegram_id"],),
             ) as cur:
                 snaps = [dict(r) for r in await cur.fetchall()]
     except Exception as exc:
         return json.dumps({"error": f"DB error: {exc}"})
 
     if not snaps:
-        return json.dumps(
-            {
-                "nickname": nickname,
-                "snapshots": [],
-                "note": "No ELO history yet.",
-            }
-        )
+        return json.dumps({"nickname": nickname, "snapshots": [], "note": "No ELO history yet."})
 
     elos = [s["elo"] for s in snaps]
-    return json.dumps(
-        {
-            "nickname": nickname,
-            "snapshots_count": len(snaps),
-            "elo_min": min(elos),
-            "elo_max": max(elos),
-            "elo_latest": elos[-1],
-            "elo_change_total": elos[-1] - elos[0],
-            "snapshots": snaps,
-        },
-        indent=2,
-    )
+    return json.dumps({
+        "nickname":         nickname,
+        "snapshots_count":  len(snaps),
+        "elo_min":          min(elos),
+        "elo_max":          max(elos),
+        "elo_latest":       elos[-1],
+        "elo_change_total": elos[-1] - elos[0],
+        "snapshots":        snaps,
+    }, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -931,16 +796,15 @@ async def get_elo_trend(nickname: str) -> str:
 # ---------------------------------------------------------------------------
 
 async def _amain() -> None:
-    global _http, _faceit
+    global _faceit
     if not FACEIT_API_KEY:
         raise SystemExit(
             "FACEIT_API_KEY is not set. "
             "Add it to a .env file next to this script or pass it as an environment variable."
         )
     await init_db()
-    async with aiohttp.ClientSession() as http:
-        _http = http
-        _faceit = FaceitAPI(http, FACEIT_API_KEY, cache=TTLCache(maxsize=500))
+    async with aiohttp.ClientSession() as session:
+        _faceit = FaceitAPI(session, FACEIT_API_KEY, cache=TTLCache(maxsize=500))
         await mcp.run_stdio_async()
 
 
